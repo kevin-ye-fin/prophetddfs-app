@@ -1,0 +1,6 @@
+streamlit
+neuralprophet>=0.8.0
+pandas
+numpy
+openpyxl
+snowflake-connector-python
