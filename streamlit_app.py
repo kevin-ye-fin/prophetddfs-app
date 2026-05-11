@@ -260,6 +260,32 @@ def run_phase2(df: pd.DataFrame, target: str, regressors: list,
 
 
 # ---------------------------------------------------------------------------
+# Phase 3 — Forward Forecast
+# ---------------------------------------------------------------------------
+
+def run_phase3(df: pd.DataFrame, target: str, freq: str, forecast_horizon: int):
+    full_df = df[["ds", target]].copy().rename(columns={target: "y"})
+
+    m = build_model(freq)
+    m.fit(full_df, freq=freq, progress=None)
+
+    future = m.make_future_dataframe(full_df, periods=forecast_horizon, n_historic_predictions=True)
+    forecast = m.predict(future)
+
+    if freq == "W":
+        forecast["ds"] = forecast["ds"].dt.to_period("W").dt.start_time
+
+    hist = forecast[forecast["ds"] <= full_df["ds"].max()][["ds", "yhat1"]].copy()
+    hist = hist.merge(full_df, on="ds", how="inner")
+    hist = hist.rename(columns={"y": "actual", "yhat1": "fitted"})
+
+    fwd = forecast[forecast["ds"] > full_df["ds"].max()][["ds", "yhat1"]].copy()
+    fwd = fwd.rename(columns={"yhat1": "forecast"})
+
+    return hist, fwd
+
+
+# ---------------------------------------------------------------------------
 # Sidebar — Data Input
 # ---------------------------------------------------------------------------
 
@@ -360,10 +386,12 @@ if "raw_df" in st.session_state:
             holdout = st.slider("Test holdout (weeks)", min_value=4, max_value=26, value=13)
             max_lag = st.slider("Max correlation lag (weeks)", min_value=4, max_value=20, value=12)
             n_lags = st.slider("NeuralProphet regressor lags (weeks)", min_value=1, max_value=12, value=4)
+            forecast_horizon = st.slider("Forecast horizon (weeks ahead)", min_value=1, max_value=26, value=13)
         else:
             holdout = st.slider("Test holdout (days)", min_value=14, max_value=180, value=90)
             max_lag = st.slider("Max correlation lag (days)", min_value=7, max_value=60, value=28)
             n_lags = st.slider("NeuralProphet regressor lags (days)", min_value=1, max_value=30, value=14)
+            forecast_horizon = st.slider("Forecast horizon (days ahead)", min_value=7, max_value=180, value=90)
 
         run_clicked = st.button("Run Analysis", type="primary", use_container_width=True)
 
@@ -482,6 +510,43 @@ if "raw_df" in st.session_state:
 
             st.session_state["phase2_summary"] = summary_df
             st.session_state["phase2_comparison"] = comparison
+
+        # Phase 3
+        st.divider()
+        st.header("Phase 3 — Forward Forecast")
+        unit = "weeks" if freq_code == "W" else "days"
+        st.caption(f"Training on all available data and forecasting {forecast_horizon} {unit} ahead (baseline model, no regressors)")
+
+        with st.spinner(f"Training forecast model on full dataset..."):
+            hist, fwd = run_phase3(work_df, target_col, freq_code, forecast_horizon)
+
+        chart_hist = hist[["ds", "actual", "fitted"]].set_index("ds")
+        chart_fwd = fwd[["ds", "forecast"]].set_index("ds")
+        chart_combined = pd.concat([chart_hist, chart_fwd])
+
+        st.subheader("Historical Fit + Forward Forecast")
+        st.line_chart(chart_combined, use_container_width=True)
+
+        col_h, col_f = st.columns(2)
+        with col_h:
+            st.subheader("Historical Fit")
+            hist_display = hist.copy()
+            hist_display["ds"] = hist_display["ds"].dt.strftime("%Y-%m-%d")
+            st.dataframe(hist_display, use_container_width=True, height=300)
+        with col_f:
+            st.subheader(f"Forecast ({forecast_horizon} {unit})")
+            fwd_display = fwd.copy()
+            fwd_display["ds"] = fwd_display["ds"].dt.strftime("%Y-%m-%d")
+            st.dataframe(fwd_display, use_container_width=True, height=300)
+
+        forecast_csv = fwd.to_csv(index=False)
+        st.download_button(
+            f"Download forecast ({forecast_horizon} {unit}) as CSV",
+            data=forecast_csv,
+            file_name="forward_forecast.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
 else:
     st.info("Load data using the sidebar to get started.")
