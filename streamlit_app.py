@@ -414,19 +414,54 @@ if "raw_df" in st.session_state:
     st.caption(f"{len(work_df):,} rows  |  {work_df['ds'].min().date()} → {work_df['ds'].max().date()}")
 
     # -------------------------------------------------------------------
-    # Run Analysis
+    # Run Analysis (store results in session_state so they survive reruns)
     # -------------------------------------------------------------------
 
     if run_clicked:
-        st.divider()
-
-        # Phase 1
-        st.header("Phase 1 — Correlation Analysis")
-
         with st.spinner("Computing correlations..."):
             pearson, spearman, lag_df, diff_pearson, diff_lag_df = run_phase1(
                 work_df, target_col, regressor_cols, max_lag
             )
+        st.session_state["phase1"] = {
+            "pearson": pearson, "spearman": spearman,
+            "lag_df": lag_df, "diff_pearson": diff_pearson, "diff_lag_df": diff_lag_df,
+        }
+
+        progress_bar = st.progress(0, text="Training models...")
+
+        def update_progress(frac, text):
+            progress_bar.progress(frac, text=text)
+
+        summary_df, comparison, error = run_phase2(
+            work_df, target_col, regressor_cols,
+            freq_code, holdout, n_lags,
+            progress_callback=update_progress,
+        )
+        progress_bar.empty()
+
+        st.session_state["phase2"] = {
+            "summary_df": summary_df, "comparison": comparison, "error": error,
+        }
+
+        unit = "weeks" if freq_code == "W" else "days"
+        with st.spinner("Training forecast model on full dataset..."):
+            hist, fwd = run_phase3(work_df, target_col, freq_code, forecast_horizon)
+        st.session_state["phase3"] = {
+            "hist": hist, "fwd": fwd,
+            "forecast_horizon": forecast_horizon, "unit": unit,
+        }
+
+    # -------------------------------------------------------------------
+    # Display results from session_state (persists across download clicks)
+    # -------------------------------------------------------------------
+
+    if "phase1" in st.session_state:
+        p1 = st.session_state["phase1"]
+        pearson, spearman = p1["pearson"], p1["spearman"]
+        lag_df, diff_pearson, diff_lag_df = p1["lag_df"], p1["diff_pearson"], p1["diff_lag_df"]
+
+        st.divider()
+        st.header("Phase 1 — Correlation Analysis")
 
         col1, col2 = st.columns(2)
         with col1:
@@ -454,25 +489,12 @@ if "raw_df" in st.session_state:
         st.dataframe(diff_pivot.style.format("{:.4f}", subset=[c for c in diff_pivot.columns if c != "lag"]),
                       use_container_width=True)
 
-        st.session_state["phase1_lag_df"] = lag_df
-        st.session_state["phase1_diff_lag_df"] = diff_lag_df
+    if "phase2" in st.session_state:
+        p2 = st.session_state["phase2"]
+        summary_df, comparison, error = p2["summary_df"], p2["comparison"], p2["error"]
 
-        # Phase 2
         st.divider()
         st.header("Phase 2 — NeuralProphet: Baseline vs Enhanced")
-
-        progress_bar = st.progress(0, text="Training models...")
-
-        def update_progress(frac, text):
-            progress_bar.progress(frac, text=text)
-
-        summary_df, comparison, error = run_phase2(
-            work_df, target_col, regressor_cols,
-            freq_code, holdout, n_lags,
-            progress_callback=update_progress,
-        )
-
-        progress_bar.empty()
 
         if error:
             st.error(error)
@@ -508,17 +530,15 @@ if "raw_df" in st.session_state:
                 use_container_width=True,
             )
 
-            st.session_state["phase2_summary"] = summary_df
-            st.session_state["phase2_comparison"] = comparison
+    if "phase3" in st.session_state:
+        p3 = st.session_state["phase3"]
+        hist, fwd = p3["hist"], p3["fwd"]
+        forecast_horizon_saved = p3["forecast_horizon"]
+        unit = p3["unit"]
 
-        # Phase 3
         st.divider()
         st.header("Phase 3 — Forward Forecast")
-        unit = "weeks" if freq_code == "W" else "days"
-        st.caption(f"Training on all available data and forecasting {forecast_horizon} {unit} ahead (baseline model, no regressors)")
-
-        with st.spinner(f"Training forecast model on full dataset..."):
-            hist, fwd = run_phase3(work_df, target_col, freq_code, forecast_horizon)
+        st.caption(f"Trained on all available data — forecasting {forecast_horizon_saved} {unit} ahead (baseline model, no regressors)")
 
         chart_hist = hist[["ds", "actual", "fitted"]].set_index("ds")
         chart_fwd = fwd[["ds", "forecast"]].set_index("ds")
@@ -534,14 +554,14 @@ if "raw_df" in st.session_state:
             hist_display["ds"] = hist_display["ds"].dt.strftime("%Y-%m-%d")
             st.dataframe(hist_display, use_container_width=True, height=300)
         with col_f:
-            st.subheader(f"Forecast ({forecast_horizon} {unit})")
+            st.subheader(f"Forecast ({forecast_horizon_saved} {unit})")
             fwd_display = fwd.copy()
             fwd_display["ds"] = fwd_display["ds"].dt.strftime("%Y-%m-%d")
             st.dataframe(fwd_display, use_container_width=True, height=300)
 
         forecast_csv = fwd.to_csv(index=False)
         st.download_button(
-            f"Download forecast ({forecast_horizon} {unit}) as CSV",
+            f"Download forecast ({forecast_horizon_saved} {unit}) as CSV",
             data=forecast_csv,
             file_name="forward_forecast.csv",
             mime="text/csv",
