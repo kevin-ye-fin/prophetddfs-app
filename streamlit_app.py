@@ -276,28 +276,23 @@ def run_phase3(df: pd.DataFrame, target: str, regressors: list,
                summary_df: pd.DataFrame,
                seasonality_mode: str = "multiplicative",
                trend_reg: float = 0, n_changepoints: int = 15):
-    """Retrain the best model from Phase 2 on all data, forecast forward."""
+    """Forward forecast using baseline model (future regressor values are unknown).
+
+    Reports the best regressor model from Phase 2 for context.
+    """
     best_row = summary_df.loc[summary_df["MAPE (%)"].idxmin()]
     best_model_name = best_row["Model"]
     best_regressors_str = best_row["Regressors"]
     best_mape = best_row["MAPE (%)"]
 
-    is_baseline = (best_regressors_str == "—")
-    best_regs = [] if is_baseline else [r.strip() for r in best_regressors_str.split(",")]
-
-    cols = ["ds", target] + best_regs
-    full_df = df[cols].copy().rename(columns={target: "y"})
+    full_df = df[["ds", target]].copy().rename(columns={target: "y"})
 
     model_kw = dict(seasonality_mode=seasonality_mode, trend_reg=trend_reg,
                     n_changepoints=n_changepoints)
     m = build_model(freq, **model_kw)
-    for reg in best_regs:
-        m.add_lagged_regressor(reg, n_lags=n_lags, normalize="minmax")
+    m.fit(full_df, freq=freq, progress=None)
 
-    train_cols = ["ds", "y"] + best_regs
-    m.fit(full_df[train_cols], freq=freq, progress=None)
-
-    future = m.make_future_dataframe(full_df[train_cols], periods=forecast_horizon,
+    future = m.make_future_dataframe(full_df, periods=forecast_horizon,
                                      n_historic_predictions=True)
     forecast = m.predict(future)
 
@@ -594,9 +589,10 @@ if "raw_df" in st.session_state:
 
         st.divider()
         st.header("Phase 3 — Forward Forecast")
-        st.caption(f"Best model: **{best_name}** (backtest MAPE: {best_mape_display}%) | "
-                   f"Regressors: {best_regs} | "
-                   f"Forecasting {forecast_horizon_saved} {unit} ahead")
+        st.caption(f"Best backtest model: **{best_name}** (MAPE: {best_mape_display}%) | "
+                   f"Regressors: {best_regs}")
+        st.caption(f"Forward forecast uses baseline model (trend + seasonality + holidays) "
+                   f"because future regressor values are unknown — {forecast_horizon_saved} {unit} ahead")
 
         chart_hist = hist[["ds", "actual", "fitted"]].set_index("ds")
         chart_fwd = fwd[["ds", "forecast"]].set_index("ds")
