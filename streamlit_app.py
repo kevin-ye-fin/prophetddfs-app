@@ -141,14 +141,16 @@ def run_phase1(df: pd.DataFrame, target: str, regressors: list, max_lag: int):
 # Phase 2 — NeuralProphet
 # ---------------------------------------------------------------------------
 
-def build_model(freq: str, **overrides):
+def build_model(freq: str, seasonality_mode: str = "multiplicative",
+                trend_reg: float = 0, n_changepoints: int = 15, **overrides):
     from neuralprophet import NeuralProphet
     params = dict(
-        seasonality_mode="multiplicative",
+        seasonality_mode=seasonality_mode,
         yearly_seasonality=True,
         weekly_seasonality=(freq == "D"),
         daily_seasonality=False,
-        n_changepoints=15,
+        n_changepoints=n_changepoints,
+        trend_reg=trend_reg,
         learning_rate=0.1,
     )
     params.update(overrides)
@@ -158,7 +160,10 @@ def build_model(freq: str, **overrides):
 
 
 def run_phase2(df: pd.DataFrame, target: str, regressors: list,
-               freq: str, holdout: int, n_lags: int, progress_callback=None):
+               freq: str, holdout: int, n_lags: int,
+               seasonality_mode: str = "multiplicative",
+               trend_reg: float = 0, n_changepoints: int = 15,
+               progress_callback=None):
     np_df = df[["ds", target] + regressors].copy()
     np_df = np_df.rename(columns={target: "y"})
 
@@ -172,6 +177,9 @@ def run_phase2(df: pd.DataFrame, target: str, regressors: list,
 
     if len(test) == 0:
         return None, None, "Holdout period too large — no test data."
+
+    model_kw = dict(seasonality_mode=seasonality_mode, trend_reg=trend_reg,
+                    n_changepoints=n_changepoints)
 
     configs = {}
     for k in range(1, len(regressors) + 1):
@@ -188,7 +196,7 @@ def run_phase2(df: pd.DataFrame, target: str, regressors: list,
         fc_df["ds"] = fc_df["ds"].dt.to_period("W").dt.start_time
         return fc_df
 
-    m_base = build_model(freq)
+    m_base = build_model(freq, **model_kw)
     train_base = train[["ds", "y"]].copy()
     m_base.fit(train_base, freq=freq, progress=None)
     future_base = m_base.make_future_dataframe(train_base, periods=len(test))
@@ -208,7 +216,7 @@ def run_phase2(df: pd.DataFrame, target: str, regressors: list,
 
     enhanced = {}
     for key, cfg in configs.items():
-        m = build_model(freq)
+        m = build_model(freq, **model_kw)
         for reg in cfg["regressors"]:
             m.add_lagged_regressor(reg, n_lags=n_lags, normalize="minmax")
         cols = ["ds", "y"] + cfg["regressors"]
@@ -263,26 +271,50 @@ def run_phase2(df: pd.DataFrame, target: str, regressors: list,
 # Phase 3 — Forward Forecast
 # ---------------------------------------------------------------------------
 
-def run_phase3(df: pd.DataFrame, target: str, freq: str, forecast_horizon: int):
-    full_df = df[["ds", target]].copy().rename(columns={target: "y"})
+def run_phase3(df: pd.DataFrame, target: str, regressors: list,
+               freq: str, forecast_horizon: int, n_lags: int,
+               summary_df: pd.DataFrame,
+               seasonality_mode: str = "multiplicative",
+               trend_reg: float = 0, n_changepoints: int = 15):
+    """Retrain the best model from Phase 2 on all data, forecast forward."""
+    best_row = summary_df.loc[summary_df["MAPE (%)"].idxmin()]
+    best_model_name = best_row["Model"]
+    best_regressors_str = best_row["Regressors"]
+    best_mape = best_row["MAPE (%)"]
 
-    m = build_model(freq)
-    m.fit(full_df, freq=freq, progress=None)
+    is_baseline = (best_regressors_str == "—")
+    best_regs = [] if is_baseline else [r.strip() for r in best_regressors_str.split(",")]
 
-    future = m.make_future_dataframe(full_df, periods=forecast_horizon, n_historic_predictions=True)
+    cols = ["ds", target] + best_regs
+    full_df = df[cols].copy().rename(columns={target: "y"})
+
+    model_kw = dict(seasonality_mode=seasonality_mode, trend_reg=trend_reg,
+                    n_changepoints=n_changepoints)
+    m = build_model(freq, **model_kw)
+    for reg in best_regs:
+        m.add_lagged_regressor(reg, n_lags=n_lags, normalize="minmax")
+
+    train_cols = ["ds", "y"] + best_regs
+    m.fit(full_df[train_cols], freq=freq, progress=None)
+
+    future = m.make_future_dataframe(full_df[train_cols], periods=forecast_horizon,
+                                     n_historic_predictions=True)
     forecast = m.predict(future)
 
     if freq == "W":
         forecast["ds"] = forecast["ds"].dt.to_period("W").dt.start_time
 
-    hist = forecast[forecast["ds"] <= full_df["ds"].max()][["ds", "yhat1"]].copy()
-    hist = hist.merge(full_df, on="ds", how="inner")
+    last_actual = full_df["ds"].max()
+
+    hist = forecast[forecast["ds"] <= last_actual][["ds", "yhat1"]].copy()
+    hist = hist.merge(full_df[["ds", "y"]], on="ds", how="inner")
     hist = hist.rename(columns={"y": "actual", "yhat1": "fitted"})
 
-    fwd = forecast[forecast["ds"] > full_df["ds"].max()][["ds", "yhat1"]].copy()
+    fwd = forecast[forecast["ds"] > last_actual][["ds", "yhat1"]].copy()
     fwd = fwd.rename(columns={"yhat1": "forecast"})
+    fwd = fwd.head(forecast_horizon)
 
-    return hist, fwd
+    return hist, fwd, best_model_name, best_mape, best_regressors_str
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +407,14 @@ if "raw_df" in st.session_state:
         freq = st.radio("Data frequency", ["Weekly", "Daily"], horizontal=True)
         freq_code = "W" if freq == "Weekly" else "D"
 
+        with st.expander("Model configuration", expanded=False):
+            seasonality_mode = st.selectbox("Seasonality mode", ["multiplicative", "additive"], index=0)
+            trend_reg = st.number_input("Trend regularization", min_value=0.0, max_value=10.0,
+                                        value=0.0, step=0.1,
+                                        help="0 = off, 0.5-1.0 = smooth trend, higher = more conservative")
+            n_changepoints = st.select_slider("Trend changepoints", options=[5, 10, 15, 20, 30], value=15,
+                                              help="Fewer = smoother trend, more = flexible")
+
         agg_rules = {}
         if freq_code == "W":
             with st.expander("Weekly aggregation rules", expanded=False):
@@ -435,6 +475,9 @@ if "raw_df" in st.session_state:
         summary_df, comparison, error = run_phase2(
             work_df, target_col, regressor_cols,
             freq_code, holdout, n_lags,
+            seasonality_mode=seasonality_mode,
+            trend_reg=trend_reg,
+            n_changepoints=n_changepoints,
             progress_callback=update_progress,
         )
         progress_bar.empty()
@@ -444,12 +487,22 @@ if "raw_df" in st.session_state:
         }
 
         unit = "weeks" if freq_code == "W" else "days"
-        with st.spinner("Training forecast model on full dataset..."):
-            hist, fwd = run_phase3(work_df, target_col, freq_code, forecast_horizon)
-        st.session_state["phase3"] = {
-            "hist": hist, "fwd": fwd,
-            "forecast_horizon": forecast_horizon, "unit": unit,
-        }
+        if summary_df is not None:
+            with st.spinner("Training best model on full dataset for forward forecast..."):
+                hist, fwd, best_name, best_mape_val, best_regs_str = run_phase3(
+                    work_df, target_col, regressor_cols,
+                    freq_code, forecast_horizon, n_lags,
+                    summary_df=summary_df,
+                    seasonality_mode=seasonality_mode,
+                    trend_reg=trend_reg,
+                    n_changepoints=n_changepoints,
+                )
+            st.session_state["phase3"] = {
+                "hist": hist, "fwd": fwd,
+                "forecast_horizon": forecast_horizon, "unit": unit,
+                "best_name": best_name, "best_mape": best_mape_val,
+                "best_regs": best_regs_str,
+            }
 
     # -------------------------------------------------------------------
     # Display results from session_state (persists across download clicks)
@@ -535,10 +588,15 @@ if "raw_df" in st.session_state:
         hist, fwd = p3["hist"], p3["fwd"]
         forecast_horizon_saved = p3["forecast_horizon"]
         unit = p3["unit"]
+        best_name = p3.get("best_name", "Baseline")
+        best_mape_display = p3.get("best_mape", "—")
+        best_regs = p3.get("best_regs", "—")
 
         st.divider()
         st.header("Phase 3 — Forward Forecast")
-        st.caption(f"Trained on all available data — forecasting {forecast_horizon_saved} {unit} ahead (baseline model, no regressors)")
+        st.caption(f"Best model: **{best_name}** (backtest MAPE: {best_mape_display}%) | "
+                   f"Regressors: {best_regs} | "
+                   f"Forecasting {forecast_horizon_saved} {unit} ahead")
 
         chart_hist = hist[["ds", "actual", "fitted"]].set_index("ds")
         chart_fwd = fwd[["ds", "forecast"]].set_index("ds")
